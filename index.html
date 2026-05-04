@@ -1243,6 +1243,54 @@ function refreshDashboardSoon(){
   }, 300);
 }
 
+// Auto-refresh cada 30s para sincronizar entre dispositivos
+let autoRefreshTimer = null;
+const AUTO_REFRESH_MS = 30000;
+
+function startAutoRefresh(){
+  stopAutoRefresh();
+  autoRefreshTimer = setInterval(async () => {
+    // Solo refrescar si el tab está visible
+    if (document.visibilityState !== 'visible') return;
+    // Si la cámara está activa procesando, esperá la siguiente vuelta
+    if (state.cam.busy) return;
+    try{
+      const d = await api('api_getDashboard');
+      state.dashboard = d;
+      // Re-renderizar la vista actual SOLO si afecta lo que está mirando
+      if (state.view === 'home') renderHomeFromCache_();
+      else if (state.view === 'equipos') renderEquiposFromCache_();
+    } catch(_){ /* silencioso */ }
+  }, AUTO_REFRESH_MS);
+}
+
+function stopAutoRefresh(){
+  if (autoRefreshTimer){ clearInterval(autoRefreshTimer); autoRefreshTimer = null; }
+}
+
+function renderHomeFromCache_(){
+  if (!state.dashboard) return;
+  const target = $('#home-content');
+  if (!target) return;
+  target.innerHTML = homeHTML(state.dashboard);
+  $$('#home-content [data-team]').forEach(c =>
+    c.addEventListener('click', () => setView('team', { code: c.dataset.team }))
+  );
+}
+
+function renderEquiposFromCache_(){
+  // renderEquipos() lee de state.dashboard, lo llamamos directamente
+  renderEquipos();
+}
+
+// Pausar/reanudar al cambiar visibilidad
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible'){
+    // Al volver al tab, refrescar inmediatamente
+    refreshDashboardSoon();
+  }
+});
+
 document.getElementById('btnRefresh').addEventListener('click', async () => {
   state.dashboard = null; state.teamCache = {};
   if (state.view === 'home') renderHome();
@@ -1253,6 +1301,7 @@ document.getElementById('btnRefresh').addEventListener('click', async () => {
 document.getElementById('btnLogout').addEventListener('click', () => {
   if (!confirm('Cerrar sesión y volver a configurar?')) return;
   if (state.cam.stream) stopCamera();
+  stopAutoRefresh();
   localStorage.removeItem('cfgUrl');
   localStorage.removeItem('cfgToken');
   CONFIG.url = ''; CONFIG.token = '';
@@ -1267,6 +1316,7 @@ function init(){
   renderLastActions();
   renderCamHistory();
   renderHome();
+  startAutoRefresh();
 }
 
 if (CONFIG.url && CONFIG.token){
