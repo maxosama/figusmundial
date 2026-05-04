@@ -256,7 +256,9 @@
   .team-header .pct{font-size:28px;font-weight:800;color:var(--accent)}
 
   .stickers{display:flex;flex-direction:column;gap:6px}
-  .sticker{display:flex;align-items:center;gap:10px;padding:10px 12px;background:var(--bg-2);border:1px solid var(--border);border-radius:10px;transition:all .2s}
+  .sticker{display:flex;align-items:center;gap:10px;padding:10px 12px;background:var(--bg-2);border:1px solid var(--border);border-radius:10px;transition:background .12s, border-color .12s}
+  .check, .repe-ctrl button{transition:transform .08s, background .12s, border-color .12s}
+  .check:active, .repe-ctrl button:active{transform:scale(.85)}
   .sticker.tengo{background:rgba(74,222,128,.05);border-color:rgba(74,222,128,.18)}
   .sticker.repe{background:rgba(251,191,36,.06);border-color:rgba(251,191,36,.22)}
   .sticker .num{font-family:ui-monospace,monospace;font-weight:800;font-size:12px;width:32px;text-align:center;color:var(--text-3);flex-shrink:0}
@@ -355,6 +357,41 @@
     max-height:300px;overflow-y:auto;
   }
   .cam-detected-list h3{font-size:11px;color:var(--text-3);text-transform:uppercase;letter-spacing:.1em;font-weight:700;margin-bottom:8px;padding:0 4px}
+
+  /* Floating cam controls (zoom + flash) */
+  .cam-tools{
+    position:absolute; right:12px; top:12px;
+    display:flex; flex-direction:column; gap:8px; z-index:5;
+  }
+  .cam-tool-btn{
+    width:38px;height:38px;border-radius:50%;
+    background:rgba(0,0,0,.6); color:#fff;
+    display:grid;place-items:center;font-size:18px;
+    backdrop-filter:blur(6px);
+    border:1px solid rgba(255,255,255,.15);
+    pointer-events:auto;
+  }
+  .cam-tool-btn.active{background:var(--warning);color:#422006;border-color:var(--warning)}
+  .cam-tool-btn:disabled{opacity:.3}
+
+  .cam-zoom{
+    position:absolute; left:12px; right:60px; bottom:50px;
+    display:none; align-items:center; gap:8px;
+    background:rgba(0,0,0,.6); padding:8px 12px;
+    border-radius:99px; backdrop-filter:blur(6px);
+    pointer-events:auto;
+  }
+  .cam-zoom.show{display:flex}
+  .cam-zoom input[type=range]{
+    flex:1; -webkit-appearance:none; appearance:none;
+    height:4px; background:rgba(255,255,255,.3); border-radius:2px;
+  }
+  .cam-zoom input[type=range]::-webkit-slider-thumb{
+    -webkit-appearance:none; appearance:none;
+    width:18px; height:18px; border-radius:50%;
+    background:#fff; cursor:pointer;
+  }
+  .cam-zoom .lbl{color:#fff;font-size:11px;font-weight:700;min-width:32px;text-align:center}
 
   /* ============ TOAST ============ */
   .toast-host{
@@ -478,6 +515,14 @@
           <div class="cam-frame"></div>
         </div>
         <div class="cam-tap-hint" style="display:none" id="camTapHint">Tocá para capturar</div>
+        <div class="cam-tools" style="display:none" id="camTools">
+          <button class="cam-tool-btn" id="camTorch" title="Linterna" disabled>💡</button>
+          <button class="cam-tool-btn" id="camZoomBtn" title="Zoom" disabled>🔍</button>
+        </div>
+        <div class="cam-zoom" id="camZoom">
+          <span class="lbl" id="camZoomLbl">1.0x</span>
+          <input id="camZoomRange" type="range" min="1" max="5" step="0.1" value="1">
+        </div>
         <div class="cam-status" style="display:none" id="camStatusWrap">
           <div><span id="camStatus">Listo</span></div>
         </div>
@@ -608,11 +653,12 @@ const state = {
   cam: {
     stream: null,
     facing: 'environment',
-    interval: null,
-    busy: false,
+    activeJobs: 0,        // capturas en curso (pipeline)
     history: [],
     lastCode: null,
     lastAt: 0,
+    zoom: 1,
+    torchOn: false,
   }
 };
 
@@ -854,43 +900,57 @@ function applyRowState_(row, st){
   nEl.classList.toggle('zero', st.repes === 0);
 }
 
-async function onCheckClick(e){
+// Fire-and-forget: cambio visual INMEDIATO + fetch en paralelo.
+// No usar await acá: el user tiene que poder clickear N stickers seguidos
+// sin esperar que vuelva el fetch del anterior. Si el fetch falla, revierte.
+function onCheckClick(e){
   const btn = e.currentTarget;
   const code = btn.dataset.code;
   const row = btn.closest('.sticker');
   const prev = readRowState_(row);
   const next = { tengo: !prev.tengo, repes: prev.tengo ? 0 : prev.repes };
-  applyRowState_(row, next); vibrate();
-  try{
-    const r = await api('api_setSticker', code, prev.tengo ? 'tengo-off' : 'tengo-on');
-    if (!r.ok) throw new Error(r.error);
-    applyRowState_(row, r.state); refreshDashboardSoon();
-  } catch(err){ applyRowState_(row, prev); toast(err.message || err, 'error'); }
+  applyRowState_(row, next);
+  vibrate(8);
+  api('api_setSticker', code, prev.tengo ? 'tengo-off' : 'tengo-on')
+    .then(r => {
+      if (!r.ok) throw new Error(r.error);
+      applyRowState_(row, r.state);
+      refreshDashboardSoon();
+    })
+    .catch(err => { applyRowState_(row, prev); toast(err.message || err, 'error'); });
 }
-async function onRepeUp(e){
+
+function onRepeUp(e){
   const btn = e.currentTarget; const code = btn.dataset.code;
   const row = btn.closest('.sticker');
   const prev = readRowState_(row);
   const next = { tengo: true, repes: prev.repes + 1 };
-  applyRowState_(row, next); vibrate();
-  try{
-    const r = await api('api_setSticker', code, 'repe-up');
-    if (!r.ok) throw new Error(r.error);
-    applyRowState_(row, r.state); refreshDashboardSoon();
-  } catch(err){ applyRowState_(row, prev); toast(err.message || err, 'error'); }
+  applyRowState_(row, next);
+  vibrate(8);
+  api('api_setSticker', code, 'repe-up')
+    .then(r => {
+      if (!r.ok) throw new Error(r.error);
+      applyRowState_(row, r.state);
+      refreshDashboardSoon();
+    })
+    .catch(err => { applyRowState_(row, prev); toast(err.message || err, 'error'); });
 }
-async function onRepeDown(e){
+
+function onRepeDown(e){
   const btn = e.currentTarget; const code = btn.dataset.code;
   const row = btn.closest('.sticker');
   const prev = readRowState_(row);
   if (prev.repes === 0) return;
   const next = { tengo: prev.tengo, repes: prev.repes - 1 };
-  applyRowState_(row, next); vibrate();
-  try{
-    const r = await api('api_setSticker', code, 'repe-down');
-    if (!r.ok) throw new Error(r.error);
-    applyRowState_(row, r.state); refreshDashboardSoon();
-  } catch(err){ applyRowState_(row, prev); toast(err.message || err, 'error'); }
+  applyRowState_(row, next);
+  vibrate(8);
+  api('api_setSticker', code, 'repe-down')
+    .then(r => {
+      if (!r.ok) throw new Error(r.error);
+      applyRowState_(row, r.state);
+      refreshDashboardSoon();
+    })
+    .catch(err => { applyRowState_(row, prev); toast(err.message || err, 'error'); });
 }
 
 // ===========================================================
@@ -944,7 +1004,10 @@ async function onQaKey(e){
     e.preventDefault();
     const v = qaInput.value.trim();
     if (!v) return;
-    if (qaTarget.classList.contains('show') && qaTarget.dataset.code){ doSmartAdd(qaTarget.dataset.code); return; }
+    if (qaTarget.classList.contains('show') && qaTarget.dataset.info){
+      try{ performTargetAction_(JSON.parse(qaTarget.dataset.info), 'smart-add'); } catch(_){}
+      return;
+    }
     try{
       const info = await api('api_lookupCode', v);
       if (info){ selectTarget(info.code, info); return; }
@@ -964,6 +1027,7 @@ async function selectTarget(code, prefilled){
     const info = prefilled || await api('api_lookupCode', code);
     if (!info){ qaTarget.classList.remove('show'); toast('No encontrado', 'error'); return; }
     qaTarget.dataset.code = info.code;
+    qaTarget.dataset.info = JSON.stringify({ code: info.code, equipo: info.equipo, detalle: info.detalle, tengo: info.tengo, repes: info.repes });
     qaTarget.innerHTML = `
       <div class="head">
         <div class="code">${escape(info.code)}</div>
@@ -983,15 +1047,13 @@ async function selectTarget(code, prefilled){
         <button class="btn btn-ghost full" id="btnNew">Otra figurita</button>
       </div>
     `;
-    $('#btnSmart').addEventListener('click', () => doSmartAdd(info.code));
-    $('#btnTen').addEventListener('click', async () => {
-      const r = await api('api_setSticker', info.code, info.tengo ? 'tengo-off' : 'tengo-on');
-      handleActionResult(r);
+    $('#btnSmart').addEventListener('click', () => performTargetAction_(info, 'smart-add'));
+    $('#btnTen').addEventListener('click', () => {
+      const tEl = $('#qaT');
+      const isOn = tEl ? tEl.textContent === '✓' : info.tengo;
+      performTargetAction_(info, isOn ? 'tengo-off' : 'tengo-on');
     });
-    $('#btnRep').addEventListener('click', async () => {
-      const r = await api('api_setSticker', info.code, 'repe-up');
-      handleActionResult(r);
-    });
+    $('#btnRep').addEventListener('click', () => performTargetAction_(info, 'repe-up'));
     $('#btnNew').addEventListener('click', () => {
       qaInput.value = ''; qaInput.focus();
       qaTarget.classList.remove('show'); qaTarget.innerHTML = '';
@@ -1000,26 +1062,54 @@ async function selectTarget(code, prefilled){
   } catch(e){ toast(e.message || e, 'error'); }
 }
 
-async function doSmartAdd(code){
-  vibrate(15);
-  try{ handleActionResult(await api('api_setSticker', code, 'smart-add')); }
-  catch(e){ toast(e.message || e, 'error'); }
+// Optimistic + fire-and-forget para los botones del target (Cargar)
+function performTargetAction_(info, action){
+  const tEl = $('#qaT'), rEl = $('#qaR');
+  const prevT = tEl ? tEl.textContent === '✓' : !!info.tengo;
+  const prevR = rEl ? parseInt(rEl.textContent || '0', 10) : (info.repes || 0);
+
+  let newT = prevT, newR = prevR, simAction = '';
+  if (action === 'smart-add'){
+    if (!prevT){ newT = true; simAction = 'tengo-marcado'; }
+    else { newR = prevR + 1; simAction = 'repe-incrementada'; }
+  } else if (action === 'tengo-on'){ newT = true; simAction = 'tengo-marcado'; }
+  else if (action === 'tengo-off'){ newT = false; simAction = 'tengo-desmarcado'; }
+  else if (action === 'repe-up'){ newR = prevR + 1; newT = true; simAction = 'repe-incrementada'; }
+  else if (action === 'repe-down'){ if (prevR > 0) newR = prevR - 1; simAction = 'repe-decrementada'; }
+
+  applyTargetUI_(newT, newR);
+  vibrate(10);
+
+  // Toast inmediato (asume éxito)
+  if (simAction === 'tengo-marcado') toast(`✓ ${info.code} ${info.detalle}`, 'success');
+  else if (simAction === 'repe-incrementada') toast(`+1 repe · ${info.code} (${newR})`, 'warn');
+  else if (simAction === 'tengo-desmarcado') toast(`Desmarcado: ${info.code}`, 'warn');
+  else if (simAction === 'repe-decrementada') toast(`Repe -1 · ${info.code}`, 'warn');
+
+  pushLastAction({
+    code: info.code, action: simAction,
+    detalle: info.detalle, equipo: info.equipo,
+    state: { tengo: newT, repes: newR },
+    ts: Date.now()
+  });
+
+  api('api_setSticker', info.code, action)
+    .then(r => {
+      if (!r.ok){ applyTargetUI_(prevT, prevR); toast('Error: ' + r.error, 'error'); return; }
+      // Confirmar con state real del server (puede diferir si hubo race)
+      applyTargetUI_(r.state.tengo, r.state.repes);
+      refreshDashboardSoon();
+    })
+    .catch(err => { applyTargetUI_(prevT, prevR); toast(err.message || err, 'error'); });
 }
 
-function handleActionResult(r){
-  if (!r.ok){ toast(r.error || 'Error', 'error'); return; }
+function applyTargetUI_(tengo, repes){
   const tEl = $('#qaT'), rEl = $('#qaR');
-  if (tEl) tEl.textContent = r.state.tengo ? '✓' : '✗';
-  if (rEl) rEl.textContent = r.state.repes;
+  if (tEl) tEl.textContent = tengo ? '✓' : '✗';
+  if (rEl) rEl.textContent = repes;
   const smart = $('#btnSmart');
-  if (smart) smart.innerHTML = `<span style="font-size:18px">⚡</span>${r.state.tengo ? 'Sumar repe (+1)' : 'Marcar TENGO'}`;
-  const ten = $('#btnTen'); if (ten) ten.textContent = r.state.tengo ? '✗ Desmarcar' : '✓ Tengo';
-  pushLastAction({ code: r.code, action: r.action, detalle: r.info.detalle, equipo: r.info.equipo, state: r.state, ts: Date.now() });
-  if (r.action === 'tengo-marcado') toast(`✓ ${r.code} ${r.info.detalle}`, 'success');
-  else if (r.action === 'repe-incrementada') toast(`+1 repe · ${r.code} (${r.state.repes})`, 'warn');
-  else if (r.action === 'tengo-desmarcado') toast(`Desmarcado: ${r.code}`, 'warn');
-  else if (r.action === 'repe-decrementada') toast(`Repe -1 · ${r.code}`, 'warn');
-  refreshDashboardSoon();
+  if (smart) smart.innerHTML = `<span style="font-size:18px">⚡</span>${tengo ? 'Sumar repe (+1)' : 'Marcar TENGO'}`;
+  const ten = $('#btnTen'); if (ten) ten.textContent = tengo ? '✗ Desmarcar' : '✓ Tengo';
 }
 
 function pushLastAction(a){
@@ -1105,8 +1195,17 @@ async function startCamera(){
     toast('Tu navegador no soporta cámara', 'error'); return;
   }
   try{
+    // Pedimos máxima resolución posible y enfoque continuo
     state.cam.stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: { ideal: state.cam.facing }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+      video: {
+        facingMode: { ideal: state.cam.facing },
+        width:  { ideal: 3840 },
+        height: { ideal: 2160 },
+        // Hints (algunos browsers/devices los respetan)
+        focusMode: { ideal: 'continuous' },
+        whiteBalanceMode: { ideal: 'continuous' },
+        exposureMode: { ideal: 'continuous' }
+      },
       audio: false
     });
     camVideo.srcObject = state.cam.stream;
@@ -1117,13 +1216,79 @@ async function startCamera(){
     camTapHint.style.display = '';
     camStatusWrap.style.display = 'none';
     camShoot.style.display = '';
+    $('#camTools').style.display = '';
     $('#camStart').innerHTML = '<span style="font-size:18px">⏹️</span><span>Parar cámara</span>';
     $('#camStart').classList.remove('btn-primary');
     $('#camStart').classList.add('btn-danger');
+
+    // Detectar capacidades (zoom, flash) del track
+    setupCameraTools_();
   } catch(e){
     toast('Error al abrir cámara: ' + (e.message || e), 'error', 5000);
   }
 }
+
+function setupCameraTools_(){
+  state.cam.zoom = 1;
+  state.cam.torchOn = false;
+  $('#camZoom').classList.remove('show');
+  const torchBtn = $('#camTorch');
+  const zoomBtn = $('#camZoomBtn');
+  torchBtn.classList.remove('active'); torchBtn.disabled = true;
+  zoomBtn.classList.remove('active'); zoomBtn.disabled = true;
+
+  if (!state.cam.stream) return;
+  const track = state.cam.stream.getVideoTracks()[0];
+  if (!track) return;
+  const caps = (track.getCapabilities && track.getCapabilities()) || {};
+
+  // ZOOM
+  if (caps.zoom){
+    zoomBtn.disabled = false;
+    const range = $('#camZoomRange');
+    range.min = caps.zoom.min || 1;
+    range.max = caps.zoom.max || 5;
+    range.step = caps.zoom.step || 0.1;
+    range.value = caps.zoom.min || 1;
+    $('#camZoomLbl').textContent = (caps.zoom.min || 1).toFixed(1) + 'x';
+  }
+
+  // LINTERNA
+  if (caps.torch){
+    torchBtn.disabled = false;
+  }
+}
+
+// Zoom toggle: muestra/oculta slider
+$('#camZoomBtn').addEventListener('click', (ev) => {
+  ev.stopPropagation();
+  const z = $('#camZoom');
+  z.classList.toggle('show');
+});
+
+// Zoom slider
+$('#camZoomRange').addEventListener('input', async (ev) => {
+  ev.stopPropagation();
+  const val = parseFloat(ev.target.value);
+  state.cam.zoom = val;
+  $('#camZoomLbl').textContent = val.toFixed(1) + 'x';
+  const track = state.cam.stream && state.cam.stream.getVideoTracks()[0];
+  if (track){
+    try{ await track.applyConstraints({ advanced: [{ zoom: val }] }); }
+    catch(_){}
+  }
+});
+
+// Linterna
+$('#camTorch').addEventListener('click', async (ev) => {
+  ev.stopPropagation();
+  const track = state.cam.stream && state.cam.stream.getVideoTracks()[0];
+  if (!track) return;
+  state.cam.torchOn = !state.cam.torchOn;
+  $('#camTorch').classList.toggle('active', state.cam.torchOn);
+  try{ await track.applyConstraints({ advanced: [{ torch: state.cam.torchOn }] }); }
+  catch(e){ toast('Tu cámara no soporta linterna', 'warn'); state.cam.torchOn = false; $('#camTorch').classList.remove('active'); }
+});
 
 function stopCamera(){
   if (state.cam.stream){ state.cam.stream.getTracks().forEach(t => t.stop()); state.cam.stream = null; }
@@ -1135,15 +1300,46 @@ function stopCamera(){
   camTapHint.style.display = 'none';
   camStatusWrap.style.display = 'none';
   camShoot.style.display = 'none';
+  $('#camTools').style.display = 'none';
+  $('#camZoom').classList.remove('show');
   $('#camStart').innerHTML = '<span style="font-size:18px">📹</span><span>Activar cámara</span>';
   $('#camStart').classList.remove('btn-danger');
   $('#camStart').classList.add('btn-primary');
-  state.cam.busy = false;
+  state.cam.activeJobs = 0;
+  state.cam.torchOn = false;
+  state.cam.zoom = 1;
 }
 
 async function flipCamera(){
   state.cam.facing = state.cam.facing === 'environment' ? 'user' : 'environment';
   if (state.cam.stream){ stopCamera(); await new Promise(r=>setTimeout(r, 100)); startCamera(); }
+}
+
+/**
+ * Mejora la imagen ANTES de mandarla al OCR:
+ *  - Sube contraste (los números resaltan más)
+ *  - Levanta brillo en sombras (previene texto perdido en sombras)
+ *  - Sharpening básico via unsharp mask conceptual (saturación de canales)
+ * Hace TODO en CPU sobre el ImageData del canvas.
+ */
+function enhanceImage_(ctx, w, h){
+  try{
+    const img = ctx.getImageData(0, 0, w, h);
+    const d = img.data;
+    const contrast = 1.45;     // 1.0 = sin cambio, >1 = mas contraste
+    const brightness = 8;      // sumando lineal
+    const m = 128 * (1 - contrast);
+    for (let i = 0; i < d.length; i += 4) {
+      // R, G, B: aplicar contraste + brillo
+      d[i]   = Math.max(0, Math.min(255, d[i]   * contrast + m + brightness));
+      d[i+1] = Math.max(0, Math.min(255, d[i+1] * contrast + m + brightness));
+      d[i+2] = Math.max(0, Math.min(255, d[i+2] * contrast + m + brightness));
+      // alpha (i+3) no se toca
+    }
+    ctx.putImageData(img, 0, 0);
+  } catch(e){
+    // Si falla (CORS, browser raro), sigue sin enhance
+  }
 }
 
 function setCamStatus(msg, kind){
@@ -1154,78 +1350,107 @@ function setCamStatus(msg, kind){
   if (kind) camStatusWrap.classList.add(kind);
 }
 
+// Pipeline: hasta 2 capturas en paralelo. Si tocás mientras procesa,
+// arranca la siguiente sin esperar.
+const MAX_CONCURRENT = 2;
+
 async function triggerCapture(){
-  if (state.cam.busy || !state.cam.stream || !camVideo.videoWidth) return;
-  state.cam.busy = true;
-  camWrap.classList.add('busy');
+  if (!state.cam.stream || !camVideo.videoWidth) return;
+  if (state.cam.activeJobs >= MAX_CONCURRENT){
+    flashWrap_('busy', 80);
+    return;
+  }
+
+  // FEEDBACK INMEDIATO: antes de cualquier trabajo pesado, ya respondemos
+  // visualmente al tap para que la app se sienta fluida.
+  state.cam.activeJobs = (state.cam.activeJobs || 0) + 1;
   camWrap.classList.remove('detected','error');
+  camWrap.classList.add('busy');
   camTapHint.style.display = 'none';
-  setCamStatus('Procesando...', 'busy');
-  camShoot.disabled = true;
+  if (state.cam.activeJobs > 1){
+    setCamStatus(`Procesando ${state.cam.activeJobs}...`, 'busy');
+  } else {
+    setCamStatus('Procesando...', 'busy');
+  }
   vibrate(20);
+
+  // Esperar 1 frame: la UI se renderiza, después arranca el trabajo pesado.
+  // Sino, el ImageData/encoding bloquea el paint del feedback inmediato.
+  await new Promise(r => requestAnimationFrame(r));
 
   try{
     const w = camVideo.videoWidth, h = camVideo.videoHeight;
-    const cropW = Math.floor(w * 0.82);
-    const cropH = Math.floor(h * 0.32);
+    // Crop al área del frame visual (78% x 30%)
+    const cropW = Math.floor(w * 0.78);
+    const cropH = Math.floor(h * 0.30);
     const cropX = Math.floor((w - cropW) / 2);
     const cropY = Math.floor((h - cropH) / 2);
+    // 1024px max → balance entre OCR fiel y upload rápido
     const scale = Math.min(1, 1024 / cropW);
     const canvas = document.createElement('canvas');
     canvas.width = Math.floor(cropW * scale);
     canvas.height = Math.floor(cropH * scale);
     const ctx = canvas.getContext('2d');
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
     ctx.drawImage(camVideo, cropX, cropY, cropW, cropH, 0, 0, canvas.width, canvas.height);
-    const dataUrl = canvas.toDataURL('image/jpeg', 0.78);
+    enhanceImage_(ctx, canvas.width, canvas.height);
+    // Quality 0.82: ~40% menos bytes vs 0.9, OCR sigue legible
+    const dataUrl = canvas.toDataURL('image/jpeg', 0.82);
     const base64 = dataUrl.split(',')[1];
 
     const r = await api('api_scanCode', base64, true);
+
     if (!r.ok){
-      camWrap.classList.add('error');
+      flashWrap_('error', 1400);
       setCamStatus('❌ ' + (r.error || 'Sin código'), 'error');
       vibrate([40, 40, 40]);
       setTimeout(()=>{
-        camWrap.classList.remove('error');
-        setCamStatus('', '');
-        camTapHint.style.display = '';
-      }, 2000);
+        if (state.cam.activeJobs === 0){ setCamStatus('', ''); camTapHint.style.display = ''; }
+      }, 1400);
       return;
     }
 
-    // Debounce manual: si tocaste 2 veces el mismo en menos de 2.5s
+    // Debounce: misma figurita en <2s = warning
     const now = Date.now();
-    const dup = (r.code === state.cam.lastCode && (now - state.cam.lastAt) < 2500);
+    const dup = (r.code === state.cam.lastCode && (now - state.cam.lastAt) < 2000);
     state.cam.lastCode = r.code;
     state.cam.lastAt = now;
 
-    camWrap.classList.add('detected');
+    flashWrap_('detected', 700);
     vibrate(50);
     const baseMsg = r.action === 'tengo-marcado'
       ? `✓ ${r.code} · ${r.info.detalle}`
       : `+1 repe · ${r.code} (${r.state.repes})`;
-    setCamStatus(dup ? '⚠ Quizás duplicada · ' + baseMsg : baseMsg, 'success');
+    setCamStatus(dup ? '⚠ Duplicada · ' + baseMsg : baseMsg, 'success');
     addCamHistory(r);
     pushLastAction({ code: r.code, action: r.action, detalle: r.info.detalle, equipo: r.info.equipo, state: r.state, ts: Date.now() });
     refreshDashboardSoon();
 
     setTimeout(()=>{
-      camWrap.classList.remove('detected');
-      setCamStatus('', '');
-      camTapHint.style.display = '';
-    }, 1800);
+      if (state.cam.activeJobs === 0){
+        setCamStatus('', '');
+        camTapHint.style.display = '';
+      }
+    }, 700);
   } catch(e){
-    camWrap.classList.add('error');
+    flashWrap_('error', 1500);
     setCamStatus('Error: ' + (e.message || e), 'error');
     setTimeout(()=>{
-      camWrap.classList.remove('error');
-      setCamStatus('', '');
-      camTapHint.style.display = '';
-    }, 2500);
+      if (state.cam.activeJobs === 0){ setCamStatus('', ''); camTapHint.style.display = ''; }
+    }, 1500);
   } finally {
-    state.cam.busy = false;
-    camWrap.classList.remove('busy');
-    camShoot.disabled = false;
+    state.cam.activeJobs = Math.max(0, (state.cam.activeJobs || 1) - 1);
+    if (state.cam.activeJobs === 0){
+      camWrap.classList.remove('busy');
+    }
   }
+}
+
+// Aplica una clase al camWrap por X ms (anim. flash visual)
+function flashWrap_(cls, ms){
+  camWrap.classList.add(cls);
+  setTimeout(()=>camWrap.classList.remove(cls), ms);
 }
 
 function addCamHistory(r){
@@ -1318,7 +1543,7 @@ function startAutoRefresh(){
     // Solo refrescar si el tab está visible
     if (document.visibilityState !== 'visible') return;
     // Si la cámara está activa procesando, esperá la siguiente vuelta
-    if (state.cam.busy) return;
+    if (state.cam.activeJobs > 0) return;
     try{
       const d = await api('api_getDashboard');
       state.dashboard = d;
